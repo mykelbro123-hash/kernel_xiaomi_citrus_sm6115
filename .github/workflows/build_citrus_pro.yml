@@ -1,0 +1,158 @@
+name: Build Greenforce Citrus OC Pro
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile Greenforce Citrus OC + KSU
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 device-tree-compiler
+
+      - name: Download Neutron Clang & AnyKernel3
+        run: |
+          mkdir -p clang
+          curl -Lo clang.tar.zst https://github.com
+          tar -I zstd -xf clang.tar.zst -C clang
+          rm -f clang.tar.zst
+          git clone --depth=1 https://github.com AnyKernel3
+
+      - name: Integrate KernelSU (Root)
+        run: |
+          curl -LSs "https://githubusercontent.com" | bash -
+
+      - name: Apply Full OC (CPU+Volt, GPU+Bus, 75Hz+Clock)
+        run: |
+          python3 - << 'EOF'
+          import glob, re
+
+          for dtsi in glob.glob("arch/arm64/boot/dts/**/bengal*.dtsi", recursive=True):
+              with open(dtsi, "r") as f:
+                  content = f.read()
+              orig = content
+
+              if "2016000000" in content and "2400000000" not in content:
+                  content = re.sub(
+                      r'(opp-hz\s*=\s*</bits/64\s+2016000000>;\s*opp-microvolt\s*=\s*<(\d+)>;)',
+                      r'\1\n\t\topp-2208000000 {\n\t\t\topp-hz = </bits/64 2208000000>;\n\t\t\topp-microvolt = <1065000>;\n\t\t};\n\t\topp-2400000000 {\n\t\t\topp-hz = </bits/64 2400000000>;\n\t\t\topp-microvolt = <1125000>;\n\t\t};',
+                      content
+                  )
+
+              if "1804800000" in content and "2016000000" not in content:
+                  content = re.sub(
+                      r'(opp-hz\s*=\s*</bits/64\s+1804800000>;\s*opp-microvolt\s*=\s*<(\d+)>;)',
+                      r'\1\n\t\topp-2016000000 {\n\t\t\topp-hz = </bits/64 2016000000>;\n\t\t\topp-microvolt = <1055000>;\n\t\t};',
+                      content
+                  )
+
+              content = content.replace("950000000", "1100000000")
+              content = content.replace("959000000", "1100000000")
+
+              if content != orig:
+                  with open(dtsi, "w") as f:
+                      f.write(content)
+                  print(f"Patched CPU & GPU OC on: {dtsi}")
+
+          for panel in glob.glob("arch/arm64/boot/dts/**/*citrus*.dtsi", recursive=True):
+              with open(panel, "r") as f:
+                  p_content = f.read()
+              orig_p = p_content
+
+              if "qcom,mdss-dsi-panel-framerate = <60>;" in p_content:
+                  p_content = p_content.replace(
+                      "qcom,mdss-dsi-panel-framerate = <60>;",
+                      "qcom,mdss-dsi-panel-framerate = <75>;"
+                  )
+                  def scale_clock(match):
+                      old_clk = int(match.group(1))
+                      new_clk = int(old_clk * 1.25)
+                      return f"qcom,mdss-dsi-panel-clockrate = <{new_clk}>;"
+
+                  p_content = re.sub(
+                      r'qcom,mdss-dsi-panel-clockrate\s*=\s*<(\d+)>;',
+                      scale_clock,
+                      p_content
+                  )
+
+              if p_content != orig_p:
+                  with open(panel, "w") as f:
+                      f.write(p_content)
+                  print(f"Patched 75Hz + Clockrate on: {panel}")
+          EOF
+
+      - name: Configure & Compile Kernel
+        run: |
+          export PATH="$(pwd)/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          if [ -f "arch/arm64/configs/vendor/citrus_defconfig" ]; then
+            DEFCONFIG="vendor/citrus_defconfig"
+          elif [ -f "arch/arm64/configs/citrus_defconfig" ]; then
+            DEFCONFIG="citrus_defconfig"
+          elif [ -f "arch/arm64/configs/vendor/bengal-perf_defconfig" ]; then
+            DEFCONFIG="vendor/bengal-perf_defconfig"
+          else
+            DEFCONFIG=$(find arch/arm64/configs -name "*citrus*" -o -name "*bengal*" | head -n 1 | sed 's|arch/arm64/configs/||')
+          fi
+
+          make O=out ARCH=arm64 $DEFCONFIG
+
+          ./scripts/config --file out/.config \
+            -e CONFIG_KSU \
+            -e CONFIG_KPROBES \
+            -e CONFIG_HAVE_KPROBES \
+            -e CONFIG_KPROBE_EVENTS \
+            -e CONFIG_OVERLAY_FS \
+            -e CONFIG_TCP_CONG_ADVANCED \
+            -e CONFIG_TCP_CONG_BBR \
+            -e CONFIG_DEFAULT_BBR
+
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      - name: Inject Performance & Memory Tuning into AnyKernel3
+        run: |
+          mkdir -p AnyKernel3/ramdisk/overlay.d
+          cat << 'EOF' > AnyKernel3/ramdisk/overlay.d/init.citrus_oc.rc
+          on boot
+              write /proc/sys/net/ipv4/tcp_congestion_control bbr
+              write /proc/sys/vm/swappiness 100
+              write /proc/sys/vm/vfs_cache_pressure 50
+              write /proc/sys/vm/dirty_ratio 20
+              write /proc/sys/vm/dirty_background_ratio 5
+          EOF
+          chmod 0750 AnyKernel3/ramdisk/overlay.d/init.citrus_oc.rc
+
+      - name: Verify & Pack AnyKernel3 Zip
+        run: |
+          if [ ! -f out/arch/arm64/boot/Image.gz-dtb ] && [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "ERROR: Kernel image tidak terbentuk!"
+            exit 1
+          fi
+          cp -f out/arch/arm64/boot/Image* AnyKernel3/
+          [ -f out/arch/arm64/boot/dtbo.img ] && cp -f out/arch/arm64/boot/dtbo.img AnyKernel3/
+          cd AnyKernel3
+          zip -r9 ../Greenforce-Citrus-OC-Pro-KSU.zip * -x .git README.md *placeholder
+
+      - name: Upload Kernel Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Greenforce-Citrus-OC-Pro-KSU
+          path: Greenforce-Citrus-OC-Pro-KSU.zip
+          
