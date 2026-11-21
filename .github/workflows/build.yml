@@ -1,0 +1,123 @@
+name: Build Greenforce Extreme OC Citrus
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          depth: 1
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git libncurses5-dev libssl-dev libxml2-utils lzop python3 wget zip zstd
+
+      - name: Clone Greenforce Clang & AnyKernel3 Citrus
+        run: |
+          git clone --depth=1 https://github.com clang
+          if git clone --depth=1 https://github.com -b citrus AnyKernel3; then
+            echo "Using official Greenforce Citrus AnyKernel3"
+          else
+            git clone --depth=1 https://github.com AnyKernel3
+            sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+            sed -i 's|/dev/block/platform/omap/omap_hsmmc.0/by-name/boot|/dev/block/bootdevice/by-name/boot|g' AnyKernel3/anykernel.sh
+          fi
+
+      - name: Patch Full OC (CPU 2.4GHz/2.01GHz, GPU 1.1GHz, Screen 75Hz, DDR Bus)
+        run: |
+          python3 -c '
+          import glob, re
+
+          for path in glob.glob("**/*.dtsi", recursive=True):
+              with open(path, "r", errors="ignore") as f:
+                  content = f.read()
+              orig = content
+
+              if "opp-hz = /bits/ 64 <2016000000>;" in content and "opp-2400000000" not in content:
+                  content = content.replace(
+                      "opp-hz = /bits/ 64 <2016000000>;",
+                      "opp-hz = /bits/ 64 <2016000000>;\n\t\t};\n\t\topp-2208000000 {\n\t\t\topp-hz = /bits/ 64 <2208000000>;\n\t\t};\n\t\topp-2304000000 {\n\t\t\topp-hz = /bits/ 64 <2304000000>;\n\t\t};\n\t\topp-2400000000 {\n\t\t\topp-hz = /bits/ 64 <2400000000>;",
+                      1
+                  )
+
+              if "opp-hz = /bits/ 64 <1804800000>;" in content and "opp-2016000000" not in content:
+                  content = content.replace(
+                      "opp-hz = /bits/ 64 <1804800000>;",
+                      "opp-hz = /bits/ 64 <1804800000>;\n\t\t};\n\t\topp-1900800000 {\n\t\t\topp-hz = /bits/ 64 <1900800000>;\n\t\t};\n\t\topp-2016000000 {\n\t\t\topp-hz = /bits/ 64 <2016000000>;",
+                      1
+                  )
+
+              if "qcom,gpu-freq = <950000000>;" in content and "1100000000" not in content:
+                  content = re.sub(
+                      r"(qcom,gpu-pwrlevel@\d+\s*\{[^}]*qcom,gpu-freq\s*=\s*<950000000>;[^}]*\};)",
+                      r"\1\n\t\tqcom,gpu-pwrlevel@0 {\n\t\t\tqcom,gpu-freq = <1100000000>;\n\t\t\tqcom,bus-freq = <4>;\n\t\t\tqcom,bus-min = <4>;\n\t\t\tqcom,bus-max = <4>;\n\t\t};",
+                      content,
+                      count=1
+                  )
+
+              if "qcom,mdss-dsi-panel-framerate = <60>;" in content:
+                  content = content.replace(
+                      "qcom,mdss-dsi-panel-framerate = <60>;",
+                      "qcom,mdss-dsi-panel-framerate = <75>;"
+                  )
+
+              if "qcom,msm-bus,vectors-KBps" in content:
+                  content = re.sub(
+                      r"(<0\s+0>\s*,\s*<\d+\s+)(\d+)(>)",
+                      lambda m: f"{m.group(1)}{int(int(m.group(2))*1.15)}{m.group(3)}" if int(m.group(2)) > 1000000 else m.group(0),
+                      content
+                  )
+
+              if content != orig:
+                  with open(path, "w") as f:
+                      f.write(content)
+          '
+
+      - name: Compile Kernel (citrus)
+        run: |
+          export PATH="$PWD/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          DEFCONFIG=$(find arch/arm64/configs -name "*citrus*defconfig" | sed 's|arch/arm64/configs/||' | head -n 1)
+          make O=out ARCH=arm64 $DEFCONFIG
+          ./scripts/config --file out/.config -e CONFIG_ZRAM -e CONFIG_CRYPTO_LZ4 -e CONFIG_CRYPTO_ZSTD
+          make O=out ARCH=arm64 olddefconfig
+          make -j$(nproc --all) O=out ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1 Image.gz-dtb dtbo.img || make -j$(nproc --all) O=out ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1 Image.gz
+
+      - name: Inject RAM & DDR Speedup Boot Script into AnyKernel3
+        run: |
+          mkdir -p AnyKernel3/ramdisk/overlay.d
+          cat << 'EOF' > AnyKernel3/ramdisk/overlay.d/init.ram_oc.rc
+          on boot
+              write /proc/sys/vm/swappiness 100
+              write /proc/sys/vm/vfs_cache_pressure 50
+              write /proc/sys/vm/dirty_ratio 20
+              write /proc/sys/vm/dirty_background_ratio 5
+              write /sys/class/devfreq/soc:qcom,cpu-llcc-ddr-bw/governor performance
+              write /sys/class/devfreq/soc:qcom,cpu0-cpu-llcc-lat/governor performance
+              write /sys/class/devfreq/soc:qcom,cpu4-cpu-llcc-lat/governor performance
+          EOF
+          chmod 0750 AnyKernel3/ramdisk/overlay.d/init.ram_oc.rc
+
+      - name: Verify & Pack Complete AnyKernel3 Zip
+        run: |
+          if [ ! -f out/arch/arm64/boot/Image.gz-dtb ] && [ ! -f out/arch/arm64/boot/Image.gz ] && [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "ERROR: Kernel image tidak terbentuk!"
+            exit 1
+          fi
+          cp -f out/arch/arm64/boot/Image* AnyKernel3/
+          [ -f out/arch/arm64/boot/dtbo.img ] && cp -f out/arch/arm64/boot/dtbo.img AnyKernel3/
+          cd AnyKernel3
+          zip -r9 ../Greenforce-Citrus-ExtremeOC-RAM.zip * -x .git README.md *placeholder
+
+      - name: Upload Kernel Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Greenforce-Citrus-ExtremeOC-RAM
+          path: Greenforce-Citrus-ExtremeOC-RAM.zip
+          
