@@ -1,0 +1,80 @@
+name: Build Greenforce Citrus OC KSU
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - qti-perf
+
+jobs:
+  build:
+    name: Compile Greenforce OC 2.4GHz 75Hz KSU
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git libncurses5-dev libssl-dev libelf-dev dwarves python3 python-is-python3 unzip wget zip zstd device-tree-compiler
+
+      - name: Setup Neutron Clang & AnyKernel3
+        run: |
+          mkdir -p clang && cd clang
+          bash <(curl -s "https://githubusercontent.com") -S
+          cd ..
+          git clone --depth=1 https://github.com AnyKernel3
+
+      - name: Integrate KernelSU
+        run: |
+          curl -LSs "https://githubusercontent.com" | bash -
+          DEFCONFIG_FILE=$(find arch/arm64/configs -name "citrus_defconfig" | head -n 1)
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG_FILE"
+          echo "CONFIG_KSU_DEBUG=n" >> "$DEFCONFIG_FILE"
+
+      - name: Apply OC 2.4GHz, GPU 1.1GHz, 75Hz & Thermal Tuning
+        run: |
+          find arch/arm64/boot/dts/qcom/ -type f \( -name "*bengal*" -o -name "*citrus*" \) -exec sed -i 's/2016000000/2400000000/g; s/2016000/2400000/g; s/1804800000/2016000000/g; s/1804800/2016000/g' {} +
+          find arch/arm64/boot/dts/qcom/ -type f \( -name "*bengal*" -o -name "*citrus*" -o -name "*gpu*" \) -exec sed -i 's/950000000/1100000000/g' {} +
+          find arch/arm64/boot/dts/qcom/ -type f \( -name "*dsi*" -o -name "*citrus*" \) -exec sed -i 's/qcom,mdss-dsi-panel-framerate = <60>;/qcom,mdss-dsi-panel-framerate = <75>;/g' {} +
+          find arch/arm64/boot/dts/qcom/ -type f \( -name "*bengal*thermal*" -o -name "*citrus*thermal*" \) -exec sed -i 's/temperature = <85000>;/temperature = <95000>;/g; s/temperature = <95000>;/temperature = <105000>;/g' {} +
+          DEFCONFIG_FILE=$(find arch/arm64/configs -name "citrus_defconfig" | head -n 1)
+          echo "CONFIG_CPU_FREQ_GOV_PERFORMANCE=y" >> "$DEFCONFIG_FILE"
+          echo "CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y" >> "$DEFCONFIG_FILE"
+
+      - name: Compile Kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$(pwd)/clang/bin:$PATH"
+          if [ -f "arch/arm64/configs/vendor/citrus_defconfig" ]; then
+            DEFCONFIG="vendor/citrus_defconfig"
+          else
+            DEFCONFIG="citrus_defconfig"
+          fi
+          make -j$(nproc --all) O=out ARCH=arm64 $DEFCONFIG
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+      - name: Pack AnyKernel3 Zip
+        run: |
+          cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          cp out/arch/arm64/boot/dtbo.img AnyKernel3/ 2>/dev/null || true
+          find out/arch/arm64/boot/dts/ -name "*.dtb" -exec cat {} + > AnyKernel3/dtb
+          cd AnyKernel3
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          sed -i 's/supported.versions=.*/supported.versions=/g' anykernel.sh
+          zip -r9 ../Greenforce-Citrus-OC-2.4GHz-75Hz-KSU.zip * -x .git README.md *placeholder
+
+      - name: Upload Kernel Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Greenforce-Citrus-OC-2.4GHz-75Hz-KSU
+          path: Greenforce-Citrus-OC-2.4GHz-75Hz-KSU.zip
